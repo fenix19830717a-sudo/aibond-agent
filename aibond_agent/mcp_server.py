@@ -145,12 +145,17 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
-        "name": "aibond_get_messages",
-        "description": "Get pending messages received from the platform (non-blocking poll).",
+        "name": "aibond_fetch_inbox",
+        "description": "Poll the inbox for messages pushed by the platform (group messages, task assignments, system notifications). Non-blocking — returns immediately with whatever is in the queue.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "default": 10, "description": "Max messages to retrieve."},
+                "limit": {"type": "integer", "default": 20, "description": "Max messages to retrieve."},
+                "types": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["message", "task_assign", "mention", "system"]},
+                    "description": "Filter by message type. Empty = all types.",
+                },
             },
         },
     },
@@ -345,16 +350,33 @@ class AibondMcpServer:
         elif name == "aibond_list_agents":
             return await self._rest_get("/api/agents/")
 
-        elif name == "aibond_get_messages":
-            limit = args.get("limit", 10)
+        elif name == "aibond_fetch_inbox":
+            limit = args.get("limit", 20)
+            type_filter = set(args.get("types", []))
+            # Drain queue, filter by type, keep unmatched back
+            kept = []
             messages = []
-            for _ in range(min(limit, self._message_queue.qsize())):
+            for _ in range(min(limit + 100, self._message_queue.qsize())):
                 try:
                     msg = self._message_queue.get_nowait()
-                    messages.append(msg)
                 except asyncio.QueueEmpty:
                     break
-            return {"messages": messages, "count": len(messages)}
+                if not type_filter or msg.get("type", "") in type_filter:
+                    messages.append(msg)
+                    if len(messages) >= limit:
+                        kept.append(msg)  # already over limit, keep remaining
+                    else:
+                        pass  # matched and within limit
+                else:
+                    kept.append(msg)  # unmatched, keep for next poll
+            # Put kept messages back
+            for m in kept:
+                await self._message_queue.put(m)
+            return {
+                "messages": messages,
+                "count": len(messages),
+                "queue_remaining": self._message_queue.qsize(),
+            }
 
         else:
             raise ValueError(f"Unknown tool: {name}")
