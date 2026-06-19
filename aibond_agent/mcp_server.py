@@ -1,13 +1,24 @@
-"""MCP Server implementation using JSON-RPC 2.0 over stdio.
+"""Aibond MCP Server — 默认通话通道。
 
-This module provides a minimal MCP (Model Context Protocol) server that
-communicates via JSON-RPC 2.0 on stdin/stdout. No external MCP library
-is required.
+设计原则：
+- MCP Server 内部持有 WebSocket 长连接，作为与 aibond 平台的持久通信通道
+- 所有平台交互通过 Tool 调用完成，使用者无需手写脚本
+- 支持双向通信：Tool 调用发消息，消息到达时通过 Tool 结果返回
 
-Exposed tools:
-    - aibond_send_message(target_id, content, target_type)
-    - aibond_list_groups()
-    - aibond_list_agents()
+用法（stdio 模式）::
+
+    python -m aibond_agent.mcp_server --server https://aib2b.bond --token abk_xxx
+
+或作为 MCP 配置::
+
+    {
+      "mcpServers": {
+        "aibond": {
+          "command": "python",
+          "args": ["-m", "aibond_agent.mcp_server", "--server", "https://aib2b.bond", "--token", "abk_xxx"]
+        }
+      }
+    }
 """
 
 from __future__ import annotations
@@ -18,243 +29,367 @@ import logging
 import sys
 from typing import Any
 
-logger = logging.getLogger("aibond_agent.mcp_server")
+logger = logging.getLogger("aibond_agent.mcp")
 
-# JSON-RPC 2.0 helpers
 _JSONRPC_VERSION = "2.0"
 
 
-def _make_response(request_id: Any, result: Any) -> dict:
-    return {
-        "jsonrpc": _JSONRPC_VERSION,
-        "id": request_id,
-        "result": result,
-    }
+def _response(request_id: Any, result: Any) -> dict:
+    return {"jsonrpc": _JSONRPC_VERSION, "id": request_id, "result": result}
 
 
-def _make_error(request_id: Any, code: int, message: str) -> dict:
-    return {
-        "jsonrpc": _JSONRPC_VERSION,
-        "id": request_id,
-        "error": {"code": code, "message": message},
-    }
+def _error(request_id: Any, code: int, message: str) -> dict:
+    return {"jsonrpc": _JSONRPC_VERSION, "id": request_id, "error": {"code": code, "message": message}}
 
 
-# Tool definitions for MCP
+# ============================================================================
+# Tool Definitions
+# ============================================================================
+
 TOOLS = [
     {
-        "name": "aibond_send_message",
-        "description": "Send a message to a user or agent on the Aibond platform.",
+        "name": "aibond_register",
+        "description": "Register this agent's capabilities (skills) to the platform.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "target_id": {
-                    "type": "string",
-                    "description": "ID of the target user or agent.",
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of skill names this agent provides.",
                 },
-                "content": {
-                    "type": "string",
-                    "description": "Message content to send.",
-                },
-                "target_type": {
-                    "type": "string",
-                    "description": 'Type of target: "user" or "agent". Default: "user".',
-                    "default": "user",
-                },
+            },
+            "required": ["skills"],
+        },
+    },
+    {
+        "name": "aibond_send_message",
+        "description": "Send a private message to a user or agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "string", "description": "Target user/agent ID."},
+                "content": {"type": "string", "description": "Message content."},
+                "target_type": {"type": "string", "enum": ["user", "agent"], "default": "user"},
             },
             "required": ["target_id", "content"],
         },
     },
     {
-        "name": "aibond_list_groups",
-        "description": "List all groups the agent belongs to.",
+        "name": "aibond_send_group_message",
+        "description": "Send a message to a group chat.",
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "group_id": {"type": "string", "description": "Group ID."},
+                "content": {"type": "string", "description": "Message content."},
+            },
+            "required": ["group_id", "content"],
         },
     },
     {
-        "name": "aibond_list_agents",
-        "description": "List all online agents on the Aibond platform.",
+        "name": "aibond_list_tasks",
+        "description": "List tasks assigned to this agent.",
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "status": {"type": "string", "enum": ["pending", "active", "completed"], "description": "Filter by status."},
+            },
+        },
+    },
+    {
+        "name": "aibond_accept_task",
+        "description": "Accept a task assigned to this agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Task session ID."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "aibond_complete_task",
+        "description": "Mark a task as completed with results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Task session ID."},
+                "result": {"type": "object", "description": "Task result data."},
+                "summary": {"type": "string", "description": "Completion summary."},
+            },
+            "required": ["session_id", "result", "summary"],
+        },
+    },
+    {
+        "name": "aibond_report_progress",
+        "description": "Report progress for an active task (0-100).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Task session ID."},
+                "progress": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Progress percentage."},
+                "description": {"type": "string", "description": "Progress description."},
+            },
+            "required": ["session_id", "progress"],
+        },
+    },
+    {
+        "name": "aibond_list_groups",
+        "description": "List groups this agent belongs to.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "aibond_list_agents",
+        "description": "List online agents.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "aibond_get_messages",
+        "description": "Get pending messages received from the platform (non-blocking poll).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10, "description": "Max messages to retrieve."},
+            },
         },
     },
 ]
 
 
-async def run_mcp_server(server: str, token: str) -> None:
-    """Run the MCP server, reading JSON-RPC from stdin and writing to stdout.
+# ============================================================================
+# MCP Server
+# ============================================================================
 
-    Args:
-        server: Aibond server base URL.
-        token: API key token.
-    """
-    # We maintain a lazy client connection; it connects on first tool use.
-    client = None
+class AibondMcpServer:
+    """MCP Server with internal WebSocket long-connection."""
 
-    async def _ensure_client():
-        """Lazily create and connect the AibondClient."""
-        nonlocal client
-        if client is None:
-            from aibond_agent.client import AibondClient
+    def __init__(self, server: str, token: str, name: str = "AibondAgent"):
+        self.server = server
+        self.token = token
+        self.name = name
+        self.client = None
+        self._message_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._connected = asyncio.Event()
 
-            client = AibondClient(server=server, token=token)
-            # Connect in background so we don't block the MCP loop
-            connect_task = asyncio.create_task(client.connect())
-            # Wait briefly for the connection to establish
+    async def start(self) -> None:
+        """Start WebSocket connection in background, then run MCP stdio loop."""
+        from aibond_agent.client import AibondClient
+
+        self.client = AibondClient(server=self.server, token=self.token, name=self.name)
+
+        # Register message handler to queue incoming messages
+        @self.client.on_message()
+        async def on_any(msg: dict):
+            await self._message_queue.put(msg)
+
+        # Start WebSocket connection in background
+        ws_task = asyncio.create_task(self.client.connect())
+
+        # Wait for connection (with timeout)
+        try:
+            await asyncio.wait_for(self._wait_for_welcome(), timeout=15)
+            logger.info("WebSocket connected, MCP server ready")
+        except asyncio.TimeoutError:
+            logger.warning("WebSocket connection timeout, MCP server starting anyway")
+
+        # Run MCP stdio loop
+        await self._mcp_loop()
+
+        # Cleanup
+        ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
+        await self.client.disconnect()
+
+    async def _wait_for_welcome(self) -> None:
+        """Wait until we receive the welcome message."""
+        while True:
+            msg = await self._message_queue.get()
+            if msg.get("type") == "welcome":
+                self._connected.set()
+                return
+
+    async def _mcp_loop(self) -> None:
+        """JSON-RPC 2.0 over stdio."""
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+
+        writer_transport, writer_protocol = await asyncio.get_event_loop().connect_write_pipe(
+            asyncio.streams.FlowControlMixin, sys.stdout
+        )
+        writer = asyncio.StreamWriter(writer_transport, writer_protocol, reader, asyncio.get_event_loop())
+
+        buf = b""
+        while True:
             try:
-                await asyncio.wait_for(connect_task, timeout=10)
-            except asyncio.TimeoutError:
-                logger.warning("Client connection timed out, proceeding anyway")
-        return client
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
 
-    async def _call_rest_api(method: str, path: str, body: dict | None = None) -> Any:
-        """Make a REST API call to the Aibond server.
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
 
-        Uses aiohttp directly to avoid depending on the client's WebSocket
-        for REST operations.
-        """
-        import aiohttp
+                    try:
+                        request = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning("Invalid JSON: %s", line)
+                        continue
 
-        url = f"{server}{path}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        async with aiohttp.ClientSession(headers=headers) as session:
-            if method.upper() == "GET":
-                async with session.get(url) as resp:
-                    return await resp.json()
-            elif method.upper() == "POST":
-                async with session.post(url, json=body) as resp:
-                    return await resp.json()
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+                    response = await self._process_request(request)
+                    if response is not None:
+                        writer.write((json.dumps(response) + "\n").encode("utf-8"))
+                        await writer.drain()
 
-    async def handle_tool_call(
-        tool_name: str, arguments: dict[str, Any]
-    ) -> Any:
-        """Dispatch a tool call to the appropriate handler."""
-        if tool_name == "aibond_send_message":
-            target_id = arguments["target_id"]
-            content = arguments["content"]
-            target_type = arguments.get("target_type", "user")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("MCP loop error")
+                break
 
-            # Use REST API to send the message
-            return await _call_rest_api(
-                "POST",
-                "/api/messages/send",
-                {
-                    "target_id": target_id,
-                    "content": content,
-                    "target_type": target_type,
-                },
-            )
+        writer.close()
+        await writer.wait_closed()
 
-        elif tool_name == "aibond_list_groups":
-            return await _call_rest_api("GET", "/api/groups")
-
-        elif tool_name == "aibond_list_agents":
-            return await _call_rest_api("GET", "/api/agents")
-
-        else:
-            raise ValueError(f"Unknown tool: {tool_name}")
-
-    async def process_request(request: dict) -> dict | None:
-        """Process a single JSON-RPC request and return a response dict (or None)."""
+    async def _process_request(self, request: dict) -> dict | None:
         method = request.get("method")
-        request_id = request.get("id")
+        req_id = request.get("id")
         params = request.get("params", {})
 
         if method == "initialize":
-            return _make_response(request_id, {
+            return _response(req_id, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "aibond-agent",
-                    "version": "0.1.0",
-                },
+                "serverInfo": {"name": "aibond-agent", "version": "0.2.0"},
             })
 
         elif method == "notifications/initialized":
-            # Notification, no response needed
             return None
 
         elif method == "tools/list":
-            return _make_response(request_id, {"tools": TOOLS})
+            return _response(req_id, {"tools": TOOLS})
 
         elif method == "tools/call":
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
             try:
-                result = await handle_tool_call(tool_name, arguments)
-                return _make_response(request_id, {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
-                    ],
+                result = await self._handle_tool(tool_name, arguments)
+                return _response(req_id, {
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
                 })
             except Exception as exc:
-                logger.exception("Tool call error: %s", tool_name)
-                return _make_error(
-                    request_id,
-                    code=500,
-                    message=f"Tool error: {exc}",
-                )
+                logger.exception("Tool error: %s", tool_name)
+                return _error(req_id, 500, f"Tool error: {exc}")
 
         else:
-            return _make_error(
-                request_id,
-                code=-32601,
-                message=f"Method not found: {method}",
+            return _error(req_id, -32601, f"Method not found: {method}")
+
+    async def _handle_tool(self, name: str, args: dict) -> Any:
+        """Dispatch tool call to WebSocket client methods."""
+        if not self.client:
+            raise RuntimeError("Client not initialized")
+
+        if name == "aibond_register":
+            skills = args.get("skills", [])
+            await self.client.register(skills=skills)
+            return {"status": "ok", "skills": skills}
+
+        elif name == "aibond_send_message":
+            await self.client.send_to(
+                target_id=args["target_id"],
+                content=args["content"],
+                target_type=args.get("target_type", "user"),
             )
+            return {"status": "sent"}
 
-    # Main read loop
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+        elif name == "aibond_send_group_message":
+            await self.client.send_group_message(
+                group_id=args["group_id"],
+                content=args["content"],
+            )
+            return {"status": "sent"}
 
-    writer_transport, writer_protocol = await asyncio.get_event_loop().connect_write_pipe(
-        asyncio.streams.FlowControlMixin, sys.stdout
-    )
-    writer = asyncio.StreamWriter(writer_transport, writer_protocol, reader, asyncio.get_event_loop())
+        elif name == "aibond_list_tasks":
+            # TODO: implement via REST API or WebSocket query
+            return {"tasks": [], "note": "Task listing via REST API not yet implemented"}
 
-    buf = b""
-    while True:
-        try:
-            chunk = await reader.read(4096)
-            if not chunk:
-                # EOF
-                break
-            buf += chunk
+        elif name == "aibond_accept_task":
+            await self.client.accept_task(args["session_id"])
+            return {"status": "accepted", "session_id": args["session_id"]}
 
-            # Process complete lines (JSON-RPC messages are newline-delimited)
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
+        elif name == "aibond_complete_task":
+            await self.client.complete_task(
+                session_id=args["session_id"],
+                result=args.get("result", {}),
+                summary=args.get("summary", ""),
+            )
+            return {"status": "completed", "session_id": args["session_id"]}
 
+        elif name == "aibond_report_progress":
+            await self.client.report_progress(
+                session_id=args["session_id"],
+                progress=args["progress"],
+                description=args.get("description", ""),
+            )
+            return {"status": "reported", "session_id": args["session_id"], "progress": args["progress"]}
+
+        elif name == "aibond_list_groups":
+            return await self._rest_get("/api/groups")
+
+        elif name == "aibond_list_agents":
+            return await self._rest_get("/api/agents/")
+
+        elif name == "aibond_get_messages":
+            limit = args.get("limit", 10)
+            messages = []
+            for _ in range(min(limit, self._message_queue.qsize())):
                 try:
-                    request = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("Invalid JSON from stdin: %s", line)
-                    continue
+                    msg = self._message_queue.get_nowait()
+                    messages.append(msg)
+                except asyncio.QueueEmpty:
+                    break
+            return {"messages": messages, "count": len(messages)}
 
-                response = await process_request(request)
-                if response is not None:
-                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                    await writer.drain()
+        else:
+            raise ValueError(f"Unknown tool: {name}")
 
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            logger.exception("Error in MCP server loop")
-            break
+    async def _rest_get(self, path: str) -> Any:
+        """Make a GET request to REST API."""
+        import urllib.request
+        url = f"{self.server}{path}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.token}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
 
-    # Cleanup
-    if client:
-        await client.disconnect()
-    writer.close()
-    await writer.wait_closed()
+
+# ============================================================================
+# CLI Entry
+# ============================================================================
+
+async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Aibond MCP Server")
+    parser.add_argument("--server", default="https://aib2b.bond", help="Aibond server URL")
+    parser.add_argument("--token", required=True, help="Agent API key")
+    parser.add_argument("--name", default="AibondAgent", help="Agent name")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
+    server = AibondMcpServer(server=args.server, token=args.token, name=args.name)
+    await server.start()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
