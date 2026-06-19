@@ -53,6 +53,7 @@ class AibondClient:
         self._heartbeat_task: asyncio.Task | None = None
         self._running = False
         self._message_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._on_connected_callback: Callable | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -91,6 +92,10 @@ class AibondClient:
             return func
         return decorator
 
+    def on_connected(self, func: Callable):
+        """Register a callback to be called after WebSocket connects successfully."""
+        self._on_connected_callback = func
+
     async def connect(self) -> None:
         """Connect to the Aibond server.
 
@@ -113,6 +118,16 @@ class AibondClient:
                 ) as ws:
                     self._ws = ws
                     logger.info("WebSocket connected (agent_id=%s)", self._agent_id)
+
+                    # Trigger on_connected callback if registered
+                    if self._on_connected_callback:
+                        try:
+                            result = self._on_connected_callback()
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception:
+                            logger.exception("on_connected callback error")
+
                     backoff = RECONNECT_BASE_DELAY  # reset on success
 
                     # Start background tasks
