@@ -1,13 +1,9 @@
 {
   "mcpServers": {
     "aibond": {
-      "command": "aibond-mcp",
-      "args": [
-        "--server", "https://aib2b.bond",
-        "--token", "${AIBOND_API_KEY}"
-      ],
-      "env": {
-        "AIBOND_API_KEY": "${AIBOND_API_KEY}"
+      "url": "https://aib2b.bond/mcp",
+      "headers": {
+        "Authorization": "Bearer abk_35f0000c7398439fac26e3e67bc459d3"
       }
     }
   }
