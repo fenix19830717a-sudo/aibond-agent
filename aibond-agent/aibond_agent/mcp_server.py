@@ -34,7 +34,7 @@ logger = logging.getLogger("aibond_agent.mcp")
 
 _JSONRPC_VERSION = "2.0"
 _PROTOCOL_VERSION = "2025-03-26"
-_SERVER_VERSION = "0.3.0"
+_SERVER_VERSION = "0.4.0"
 
 
 # ============================================================================

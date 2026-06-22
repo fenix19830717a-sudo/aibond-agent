@@ -9,16 +9,23 @@ aibond 平台前端 Playwright 测试
     pip install playwright pytest-playwright
     playwright install chromium
     pytest tests/test_platform.py -v
+
+配置:
+    设置环境变量:
+        AIBOND_TEST_URL=https://aib2b.bond
+        AIBOND_TEST_USERNAME=your_username
+        AIBOND_TEST_PASSWORD=your_password
 """
 
+import os
 import re
 import pytest
 from playwright.sync_api import Page, expect
 
 
-BASE_URL = "https://aib2b.bond"
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123"
+BASE_URL = os.environ.get("AIBOND_TEST_URL", "https://aib2b.bond")
+ADMIN_USERNAME = os.environ.get("AIBOND_TEST_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("AIBOND_TEST_PASSWORD", "admin123")
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +82,7 @@ def test_login_page_loads(page: Page):
 
 
 def test_login_with_valid_credentials(page: Page):
-    """使用 admin/admin123 登录后应重定向到主页面。"""
+    """使用有效凭据登录后应重定向到主页面。"""
     page.goto(f"{BASE_URL}/login")
     page.wait_for_load_state("networkidle")
 
@@ -93,7 +100,7 @@ def test_login_with_valid_credentials(page: Page):
     page.locator('button:has-text("登录"), button[type="submit"]').first.click()
 
     # 等待导航完成
-    page.wait_for_url(re.compile(r"^https://aib2b\.bond/(?!login).*$"), timeout=15000)
+    page.wait_for_url(re.compile(rf"^{re.escape(BASE_URL)}/(?!login).*$"), timeout=15000)
     current_url = page.url
     assert "/login" not in current_url, f"登录后未跳转, 当前 URL: {current_url}"
 
@@ -199,7 +206,7 @@ def _login_and_wait(page: Page):
     page.locator("input[type='password']").first.fill(ADMIN_PASSWORD)
     page.locator('button:has-text("登录"), button[type="submit"]').first.click()
 
-    page.wait_for_url(re.compile(r"^https://aib2b\.bond/(?!login).*$"), timeout=15000)
+    page.wait_for_url(re.compile(rf"^{re.escape(BASE_URL)}/(?!login).*$"), timeout=15000)
     page.wait_for_load_state("networkidle")
 
 

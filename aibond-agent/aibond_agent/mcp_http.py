@@ -240,7 +240,7 @@ async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
         "service": "aibond-mcp-http",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "protocol": "2025-03-26",
         "active_sessions": len(_sessions),
     })
