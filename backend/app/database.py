@@ -2,12 +2,16 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import DeclarativeBase
 from app.config import settings
 
+# Conditional engine args: SQLite needs check_same_thread=False, PostgreSQL does not
+engine_args: dict = {}
+if settings.DATABASE_URL.startswith("sqlite"):
+    engine_args["connect_args"] = {"check_same_thread": False}
+
 # Disable echo in production to prevent SQL leakage in logs
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    # Security: enable SSL for production databases
-    # connect_args={"check_same_thread": False} only for SQLite
+    **engine_args,
 )
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

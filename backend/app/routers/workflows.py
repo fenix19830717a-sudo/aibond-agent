@@ -7,6 +7,7 @@ import uuid
 from app.database import get_db
 from app.models.models import Workflow, WorkflowInstance
 from app.security import rate_limit
+from app.workflows.engine import WorkflowEngine
 
 router = APIRouter(prefix="/api/workflows", tags=["workflows"])
 
@@ -95,30 +96,17 @@ async def update_workflow_definition(workflow_id: str, req: UpdateDefinitionRequ
 async def run_workflow(workflow_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     await rate_limit(request, limit=10, window=60)
 
+    # Verify workflow exists
     result = await db.execute(select(Workflow).where(Workflow.id == workflow_id))
     workflow = result.scalar_one_or_none()
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    # 从节点定义中提取第一个AI节点的agent_id
-    first_ai_agent = None
-    nodes = workflow.definition.get("nodes", []) if workflow.definition else []
-    for node in nodes:
-        node_data = node.get("data", {}) if isinstance(node, dict) else {}
-        if node_data.get("nodeType") == "ai":
-            config = node_data.get("config", {})
-            first_ai_agent = config.get("agent_id")
-            break
+    # Execute workflow using the engine
+    engine = WorkflowEngine(db)
+    engine_result = await engine.run(workflow_id)
 
-    instance = WorkflowInstance(
-        id=str(uuid.uuid4()),
-        workflow_id=workflow_id,
-        status="running",
-        context={"first_ai_agent": first_ai_agent},
-        node_results=[],
-    )
-    db.add(instance)
-    await db.commit()
-    await db.refresh(instance)
+    if "error" in engine_result:
+        raise HTTPException(status_code=400, detail=engine_result["error"])
 
-    return {"instance_id": instance.id, "status": instance.status, "first_ai_agent": first_ai_agent}
+    return engine_result

@@ -8,6 +8,7 @@ class Settings:
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
 
     # Database
+    # Production: postgresql+asyncpg://user:pass@host:5432/aibond
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibond.db")
 
     # JWT - 强制从环境变量读取，不存在则生成随机密钥（每次重启失效，强制用户配置）
